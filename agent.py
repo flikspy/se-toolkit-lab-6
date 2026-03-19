@@ -22,32 +22,43 @@ from dotenv import load_dotenv
 # Maximum tool calls per question
 MAX_TOOL_CALLS = 10
 
-# System prompt for the documentation agent
-SYSTEM_PROMPT = """You are a documentation agent that answers questions about a software engineering project.
+# System prompt for the system agent
+SYSTEM_PROMPT = """You are a documentation and system agent that answers questions about a software engineering project.
 
-You have access to two tools:
-1. list_files - List files in a directory
-2. read_file - Read the contents of a file
+You have access to three tools:
+1. list_files - List files in a directory (use for discovering wiki files)
+2. read_file - Read the contents of a file (use for wiki docs or source code)
+3. query_api - Call the backend LMS API (use for live data: items, scores, analytics)
 
 When answering questions:
-1. First use list_files to discover relevant files in the wiki/ directory
-2. Then use read_file to read the content of relevant files
-3. Find the specific section that answers the question
-4. Provide the answer with a source reference in format: wiki/filename.md#section-anchor
+- For wiki/documentation questions: use list_files to discover files, then read_file to read content
+- For source code questions: use read_file to examine the code (e.g., backend/app/main.py for framework info)
+- For data questions (how many items, what's the score, completion rate): use query_api
+- For system facts (framework, ports, status codes): check wiki first, then source code
+
+Always provide a source reference when possible:
+- Wiki: wiki/filename.md#section-anchor (use lowercase, hyphens for spaces)
+- Source code: backend/app/filename.py or the actual file path
+- API data: API endpoint path (e.g., "GET /items/" or "GET /analytics/completion-rate")
 
 Rules:
-- Always include a source reference pointing to the wiki file and section
-- Use markdown anchors (lowercase, hyphens instead of spaces)
-- If you cannot find the answer in the wiki, say so
+- Use the right tool for the question type
 - Maximum 10 tool calls per question
+- If you cannot find the answer, say so honestly
 """
 
 
 def load_env() -> None:
-    """Load environment variables from .env.agent.secret."""
+    """Load environment variables from .env.agent.secret and .env.docker.secret."""
+    # Load LLM config
     env_file = Path(__file__).parent / ".env.agent.secret"
     if env_file.exists():
-        load_dotenv(env_file)
+        load_dotenv(env_file, override=False)
+
+    # Load LMS API config
+    docker_env_file = Path(__file__).parent / ".env.docker.secret"
+    if docker_env_file.exists():
+        load_dotenv(docker_env_file, override=False)
 
 
 def get_llm_config() -> dict[str, str]:
@@ -67,6 +78,17 @@ def get_llm_config() -> dict[str, str]:
         "api_key": api_key,
         "api_base": api_base.rstrip("/"),
         "model": model,
+    }
+
+
+def get_api_config() -> dict[str, str]:
+    """Get backend API configuration from environment variables."""
+    api_key = os.getenv("LMS_API_KEY")
+    base_url = os.getenv("AGENT_API_BASE_URL", "http://localhost:42002")
+
+    return {
+        "api_key": api_key or "",
+        "base_url": base_url.rstrip("/"),
     }
 
 
@@ -154,19 +176,73 @@ def list_files(path: str) -> str:
         return f"Error listing directory: {e}"
 
 
+def query_api(method: str, path: str, body: str | None = None) -> str:
+    """Call the backend LMS API.
+
+    Args:
+        method: HTTP method (GET, POST, PUT, DELETE)
+        path: API endpoint path (e.g., '/items/', '/analytics/scores')
+        body: Optional JSON request body for POST/PUT requests
+
+    Returns:
+        JSON string with status_code and response body
+    """
+    api_config = get_api_config()
+    base_url = api_config["base_url"]
+    api_key = api_config["api_key"]
+
+    url = f"{base_url}{path}"
+    headers = {
+        "Content-Type": "application/json",
+    }
+
+    # Add authentication header if API key is available
+    if api_key:
+        headers["X-API-Key"] = api_key
+
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            if method.upper() == "GET":
+                response = client.get(url, headers=headers)
+            elif method.upper() == "POST":
+                data = json.loads(body) if body else {}
+                response = client.post(url, headers=headers, json=data)
+            elif method.upper() == "PUT":
+                data = json.loads(body) if body else {}
+                response = client.put(url, headers=headers, json=data)
+            elif method.upper() == "DELETE":
+                response = client.delete(url, headers=headers)
+            else:
+                return f"Error: Unsupported HTTP method: {method}"
+
+            result = {
+                "status_code": response.status_code,
+                "body": response.text,
+            }
+            return json.dumps(result)
+    except httpx.TimeoutException:
+        return f"Error: API request timed out for {method} {path}"
+    except httpx.ConnectError as e:
+        return f"Error: Cannot connect to API at {base_url}: {e}"
+    except json.JSONDecodeError as e:
+        return f"Error: Invalid JSON body: {e}"
+    except Exception as e:
+        return f"Error: API request failed: {e}"
+
+
 # Tool schemas for OpenAI function calling
 TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read the contents of a file from the project",
+            "description": "Read the contents of a file from the project (wiki docs or source code)",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative path from project root (e.g., 'wiki/git-workflow.md')",
+                        "description": "Relative path from project root (e.g., 'wiki/git-workflow.md' or 'backend/app/main.py')",
                     }
                 },
                 "required": ["path"],
@@ -177,7 +253,7 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "list_files",
-            "description": "List files and directories in a directory",
+            "description": "List files and directories in a directory (use for discovering wiki files)",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -190,12 +266,39 @@ TOOL_SCHEMAS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_api",
+            "description": "Call the backend LMS API to fetch live data (items, scores, analytics) or system information",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "method": {
+                        "type": "string",
+                        "description": "HTTP method (GET, POST, PUT, DELETE)",
+                        "enum": ["GET", "POST", "PUT", "DELETE"],
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "API endpoint path (e.g., '/items/', '/analytics/scores', '/analytics/completion-rate')",
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Optional JSON request body for POST/PUT requests",
+                    },
+                },
+                "required": ["method", "path"],
+            },
+        },
+    },
 ]
 
 # Map tool names to functions
 TOOL_FUNCTIONS = {
     "read_file": read_file,
     "list_files": list_files,
+    "query_api": query_api,
 }
 
 
@@ -270,7 +373,7 @@ def call_llm(
                         )
 
             return {
-                "content": message.get("content", ""),
+                "content": message.get("content") or "",
                 "tool_calls": tool_calls,
             }
     except httpx.TimeoutException:
@@ -289,7 +392,7 @@ def call_llm(
 def extract_source_from_answer(answer: str) -> str:
     """Extract source reference from the answer text.
 
-    Looks for patterns like wiki/filename.md#section-anchor in the answer.
+    Looks for patterns like wiki/filename.md#section-anchor or backend/app/*.py in the answer.
     """
     import re
 
@@ -302,6 +405,18 @@ def extract_source_from_answer(answer: str) -> str:
     # Look for wiki file references without anchors
     pattern = r"wiki/[\w-]+\.md"
     match = re.search(pattern, answer)
+    if match:
+        return match.group(0)
+
+    # Look for backend source file references
+    pattern = r"backend/app/[\w/.]+\.py"
+    match = re.search(pattern, answer)
+    if match:
+        return match.group(0)
+
+    # Look for API endpoint references
+    pattern = r"(GET|POST|PUT|DELETE)\s+/\S+"
+    match = re.search(pattern, answer, re.IGNORECASE)
     if match:
         return match.group(0)
 
