@@ -13,8 +13,8 @@ def test_agent_outputs_valid_json_with_required_fields() -> None:
     This test runs agent.py as a subprocess with a simple question,
     parses the stdout JSON, and verifies the required fields are present.
     """
-    # Get the project root directory (parent of backend/)
-    project_root = Path(__file__).parent.parent.parent.parent
+    # Get the project root directory (parent of tests/)
+    project_root = Path(__file__).parent.parent
 
     # Check if .env.agent.secret exists, skip if not configured
     env_file = project_root / ".env.agent.secret"
